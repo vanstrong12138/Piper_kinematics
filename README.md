@@ -11,8 +11,8 @@
 - Eigen3
 
 ## 仓库
-- 跳转仓库[https://github.com/vanstrong12138/Piper_kinematics](https://github.com/vanstrong12138/Piper_kinematics)
-- 主仓库[https://github.com/agilexrobotics/Agilex-College](https://github.com/agilexrobotics/Agilex-College)
+- Piper_kinematics:[https://github.com/vanstrong12138/Piper_kinematics](https://github.com/vanstrong12138/Piper_kinematics)
+- Agilex-College:[https://github.com/agilexrobotics/Agilex-College](https://github.com/agilexrobotics/Agilex-College)
 
 ## 环境配置：
 
