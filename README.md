@@ -22,6 +22,12 @@ sudo apt install libeigen3-dev
 sudo apt install ros-noetic-eigen-conversions 
 ```
 
+- 克隆仓库
+```bash
+cd your_ws/src
+git clone https://github.com/vanstrong12138/Piper_kinematics.git
+```
+
 ## 编译
 ```bash
 cd your_ws
@@ -56,7 +62,7 @@ cd piper_ros
 
 2. 启动PIPER真机控制节点
 ```bash
-roslaunch piper_kinematics start_single_piper_ik_rviz.launch
+roslaunch piper_ros start_single_piper_ik_rviz.launch
 ```
 
 3. 启动运动学逆解节点
