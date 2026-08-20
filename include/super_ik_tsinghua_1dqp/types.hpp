@@ -31,6 +31,7 @@ struct PaperParams {
   int psi_recover_samples { 25 };
   bool enable_global_fallback { true };
   int global_fallback_samples { 121 };
+  double branch_jump_threshold { 0.4 };
 };
 
 struct IkReport {

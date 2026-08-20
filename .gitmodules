@@ -1,0 +1,3 @@
+[submodule "sim_ws/src/agx_arm_sim"]
+	path = sim_ws/src/agx_arm_sim
+	url = https://github.com/agilexrobotics/agx_arm_sim.git

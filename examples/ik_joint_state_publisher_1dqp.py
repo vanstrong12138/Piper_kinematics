@@ -28,7 +28,7 @@ class IkJointStatePublisher1DQP(Node):
         self.declare_parameter("ik_base_frame", "base_link")
         self.declare_parameter("default_target_frame", "base_link")
         self.declare_parameter("republish_rate_hz", 20.0)
-        self.declare_parameter("trajectory_window_size", 8)
+        self.declare_parameter("trajectory_window_size", 50)
         self.declare_parameter("delta_psi", 1e-3)
         self.declare_parameter("danger_threshold", 0.8)
         self.declare_parameter("feasible_scan_step", 0.01)
@@ -41,14 +41,26 @@ class IkJointStatePublisher1DQP(Node):
         self.declare_parameter("tcp_in_link7_xyz", [0.0, 0.0, 0.0])
         self.declare_parameter("tcp_in_link7_rpy", [0.0, 0.0, 0.0])
         self.declare_parameter("ik_perf_log_hz", 1.0)
+        # 仿真场景: 启动即发布零位 joint_states 使 TF 立即可用;
+        # 真实机械臂场景建议置 false (首帧发布实际关节角前不发布)。
+        self.declare_parameter("initial_publish_zero", True)
 
         self._target_pose_topic = str(self.get_parameter("target_pose_topic").value)
         self._joint_state_topic = str(self.get_parameter("joint_state_topic").value)
         self._ik_base_frame = str(self.get_parameter("ik_base_frame").value)
-        self._default_target_frame = str(self.get_parameter("default_target_frame").value)
+        self._default_target_frame = str(
+            self.get_parameter("default_target_frame").value
+        )
         self._republish_rate_hz = float(self.get_parameter("republish_rate_hz").value)
-        self._ik_perf_log_hz = max(0.1, float(self.get_parameter("ik_perf_log_hz").value))
-        self._trajectory_window_size = max(1, int(self.get_parameter("trajectory_window_size").value))
+        self._ik_perf_log_hz = max(
+            0.1, float(self.get_parameter("ik_perf_log_hz").value)
+        )
+        self._initial_publish_zero = bool(
+            self.get_parameter("initial_publish_zero").value
+        )
+        self._trajectory_window_size = max(
+            1, int(self.get_parameter("trajectory_window_size").value)
+        )
         tcp_xyz = [float(v) for v in self.get_parameter("tcp_in_link7_xyz").value]
         tcp_rpy = [float(v) for v in self.get_parameter("tcp_in_link7_rpy").value]
         self._tcp_xyz = tcp_xyz
@@ -58,13 +70,25 @@ class IkJointStatePublisher1DQP(Node):
 
         self._paper = PaperParams()
         self._paper.delta_psi = float(self.get_parameter("delta_psi").value)
-        self._paper.danger_threshold = float(self.get_parameter("danger_threshold").value)
-        self._paper.feasible_scan_step = float(self.get_parameter("feasible_scan_step").value)
+        self._paper.danger_threshold = float(
+            self.get_parameter("danger_threshold").value
+        )
+        self._paper.feasible_scan_step = float(
+            self.get_parameter("feasible_scan_step").value
+        )
         self._paper.psi_seed_samples = int(self.get_parameter("psi_seed_samples").value)
-        self._paper.psi_recover_window = float(self.get_parameter("psi_recover_window").value)
-        self._paper.psi_recover_samples = int(self.get_parameter("psi_recover_samples").value)
-        self._paper.enable_global_fallback = bool(self.get_parameter("enable_global_fallback").value)
-        self._paper.global_fallback_samples = int(self.get_parameter("global_fallback_samples").value)
+        self._paper.psi_recover_window = float(
+            self.get_parameter("psi_recover_window").value
+        )
+        self._paper.psi_recover_samples = int(
+            self.get_parameter("psi_recover_samples").value
+        )
+        self._paper.enable_global_fallback = bool(
+            self.get_parameter("enable_global_fallback").value
+        )
+        self._paper.global_fallback_samples = int(
+            self.get_parameter("global_fallback_samples").value
+        )
 
         self._joint_names: List[str] = [
             "joint1",
@@ -79,7 +103,9 @@ class IkJointStatePublisher1DQP(Node):
         self._solver = Solver(paper=self._paper)
         self._q_prev = np.zeros(7, dtype=float)
         self._psi_prev = 0.0
-        self._last_q: Optional[np.ndarray] = None
+        self._last_q: Optional[np.ndarray] = (
+            np.zeros(7, dtype=float) if self._initial_publish_zero else None
+        )
         self._target_history = deque(maxlen=self._trajectory_window_size)
         self._ik_solve_count = 0
         self._ik_solve_fail_count = 0
@@ -89,6 +115,11 @@ class IkJointStatePublisher1DQP(Node):
         self._joint_pub = self.create_publisher(JointState, self._joint_state_topic, 10)
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+        # TF lookup 缓存: 拖动场景 target 帧基本恒为 ik_base_frame (恒等) 或
+        # 少数静态帧; 每次消息都查 TF buffer 是高频下的主要开销, 缓存后大幅降低。
+        # key: source_frame; value: (T_ikbase_source, 缓存时刻)
+        self._tf_cache: dict = {}
+        self._tf_cache_ttl = 0.1  # 秒; 动态帧在窗口内近似为常数 (拖动场景足够)
         self._target_sub = self.create_subscription(
             PoseStamped, self._target_pose_topic, self._on_target_pose, 10
         )
@@ -113,32 +144,50 @@ class IkJointStatePublisher1DQP(Node):
             f"IK perf logging enabled: {self._ik_perf_log_hz:.2f} Hz"
         )
 
+    def _lookup_tf(self, source_frame: str, stamp_msg) -> np.ndarray:
+        """带缓存的 TF lookup: 返回 T_ikbase_source。
+
+        - source_frame == ik_base_frame: 恒等变换, 零开销 (拖动场景主路径)。
+        - 其他 frame: 缓存最近一次结果 (TTL 0.1s), 动态帧在窗口内近似为常数;
+          拖动/交互场景目标帧基本不变, 该近似对位姿精度无实际影响。
+        """
+        if source_frame == self._ik_base_frame:
+            return np.eye(4)
+        now = time.perf_counter()
+        cached = self._tf_cache.get(source_frame)
+        if cached is not None and (now - cached[1]) < self._tf_cache_ttl:
+            return cached[0]
+        stamp = (
+            Time.from_msg(stamp_msg) if (stamp_msg.sec or stamp_msg.nanosec) else Time()
+        )
+        tf_msg = self._tf_buffer.lookup_transform(
+            self._ik_base_frame,
+            source_frame,
+            stamp,
+            timeout=Duration(seconds=0.1),
+        )
+        T = self._transform_stamped_to_matrix(tf_msg)
+        self._tf_cache[source_frame] = (T, now)
+        return T
+
     def _on_target_pose(self, msg: PoseStamped) -> None:
-        source_frame = msg.header.frame_id if msg.header.frame_id else self._default_target_frame
+        source_frame = (
+            msg.header.frame_id if msg.header.frame_id else self._default_target_frame
+        )
         T_source_target = self._pose_to_transform(msg.pose)
         if T_source_target is None:
-            self.get_logger().warning("Ignore target pose: invalid quaternion norm too small")
+            self.get_logger().warning(
+                "Ignore target pose: invalid quaternion norm too small"
+            )
             return
 
         try:
-            stamp = (
-                Time.from_msg(msg.header.stamp)
-                if (msg.header.stamp.sec or msg.header.stamp.nanosec)
-                else Time()
-            )
-            tf_msg = self._tf_buffer.lookup_transform(
-                self._ik_base_frame,
-                source_frame,
-                stamp,
-                timeout=Duration(seconds=0.1),
-            )
+            T_ikbase_source = self._lookup_tf(source_frame, msg.header.stamp)
         except TransformException as exc:
             self.get_logger().warning(
                 f"TF lookup failed ({source_frame} -> {self._ik_base_frame}): {exc}"
             )
             return
-
-        T_ikbase_source = self._transform_stamped_to_matrix(tf_msg)
         # Incoming target is interpreted as desired TCP pose.
         # IK solver target is link7 pose, so convert by T_link7 = T_tcp * inv(T_link7_tcp).
         T_ikbase_tcp = T_ikbase_source @ T_source_target
@@ -212,7 +261,9 @@ class IkJointStatePublisher1DQP(Node):
         self._publish_joint_state(self._last_q, self._ik_base_frame)
 
     @staticmethod
-    def _quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> Optional[np.ndarray]:
+    def _quat_to_rot(
+        qx: float, qy: float, qz: float, qw: float
+    ) -> Optional[np.ndarray]:
         n = qx * qx + qy * qy + qz * qz + qw * qw
         if n < 1e-12:
             return None
@@ -234,7 +285,10 @@ class IkJointStatePublisher1DQP(Node):
 
     def _pose_to_transform(self, pose) -> Optional[np.ndarray]:
         R = self._quat_to_rot(
-            pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
         )
         if R is None:
             return None
