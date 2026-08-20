@@ -24,7 +24,7 @@ class InteractiveTargetPoseTool(Node):
         self.declare_parameter("ee_link", "link7")
         self.declare_parameter("marker_scale", 0.25)
         self.declare_parameter("publish_topic", "/ik_target_pose")
-        self.declare_parameter("publish_rate_hz", 20.0)
+        self.declare_parameter("publish_rate_hz", 2000.0)
 
         self._frame_id = str(self.get_parameter("frame_id").value)
         self._ee_link = str(self.get_parameter("ee_link").value)
